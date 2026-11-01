@@ -1,0 +1,13 @@
+services:
+  iot-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: esp32-iot-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/iot_sensor.db
