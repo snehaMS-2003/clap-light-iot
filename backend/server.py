@@ -6,7 +6,20 @@ from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import urllib.parse
 
-PORT = 8000
+# PostgreSQL / Supabase connection support
+SUPABASE_DB_URL = os.getenv("DATABASE_URL")
+USE_POSTGRES = bool(SUPABASE_DB_URL and SUPABASE_DB_URL.startswith("postgres"))
+
+if USE_POSTGRES:
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        print(f"[*] Supabase PostgreSQL mode enabled.")
+    except ImportError:
+        print("[!] psycopg2 not installed. Falling back to SQLite.")
+        USE_POSTGRES = False
+
+PORT = int(os.getenv("PORT", 8000))
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "data", "iot_sensor.db"))
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -14,24 +27,46 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # Database Initialization
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sensor_readings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sound_level INTEGER NOT NULL,
-            threshold INTEGER NOT NULL,
-            led_state INTEGER NOT NULL,
-            device_id TEXT DEFAULT 'ESP32_KY038_Node',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+    if USE_POSTGRES:
+        try:
+            conn = psycopg2.connect(SUPABASE_DB_URL)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_readings (
+                    id SERIAL PRIMARY KEY,
+                    sound_level INTEGER NOT NULL,
+                    threshold INTEGER NOT NULL,
+                    led_state INTEGER NOT NULL,
+                    device_id VARCHAR(100) DEFAULT 'ESP32_KY038_Node',
+                    timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("[*] Supabase 'sensor_readings' table initialized successfully.")
+        except Exception as e:
+            print(f"[!] Error initializing Supabase table: {e}")
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sound_level INTEGER NOT NULL,
+                threshold INTEGER NOT NULL,
+                led_state INTEGER NOT NULL,
+                device_id TEXT DEFAULT 'ESP32_KY038_Node',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
 
 init_db()
 
-# In-memory latest record for lightweight polling/updates
+# In-memory latest record for lightweight streaming/updates
 latest_cache = {
     "sound_level": 0,
     "threshold": 960,
@@ -69,19 +104,36 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                 device_id = str(data.get("device_id", "ESP32_KY038_Node"))
                 timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+                reading_id = None
                 with db_lock:
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO sensor_readings (sound_level, threshold, led_state, device_id, timestamp)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (sound_level, threshold, led_state, device_id, timestamp)
-                    )
-                    conn.commit()
-                    reading_id = cursor.lastrowid
-                    conn.close()
+                    if USE_POSTGRES:
+                        conn = psycopg2.connect(SUPABASE_DB_URL)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            """
+                            INSERT INTO sensor_readings (sound_level, threshold, led_state, device_id, timestamp)
+                            VALUES (%s, %s, %s, %s, %s) RETURNING id;
+                            """,
+                            (sound_level, threshold, led_state, device_id, timestamp)
+                        )
+                        reading_id = cursor.fetchone()[0]
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                    else:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            """
+                            INSERT INTO sensor_readings (sound_level, threshold, led_state, device_id, timestamp)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (sound_level, threshold, led_state, device_id, timestamp)
+                        )
+                        conn.commit()
+                        reading_id = cursor.lastrowid
+                        cursor.close()
+                        conn.close()
 
                 # Update cache
                 latest_cache.update({
@@ -97,7 +149,7 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self._send_cors_headers()
                 self.end_headers()
-                response = {"status": "success", "id": reading_id}
+                response = {"status": "success", "id": reading_id, "db": "supabase" if USE_POSTGRES else "sqlite"}
                 self.wfile.write(json.dumps(response).encode("utf-8"))
             except Exception as e:
                 self.send_response(400)
@@ -122,33 +174,61 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             limit = int(query.get("limit", [30])[0])
 
+            history = []
             with db_lock:
-                conn = sqlite3.connect(DB_PATH)
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT id, sound_level, threshold, led_state, device_id, timestamp
-                    FROM sensor_readings
-                    ORDER BY id DESC
-                    LIMIT ?
-                    """,
-                    (limit,)
-                )
-                rows = cursor.fetchall()
-                conn.close()
-
-            history = [
-                {
-                    "id": r["id"],
-                    "sound_level": r["sound_level"],
-                    "threshold": r["threshold"],
-                    "led_state": bool(r["led_state"]),
-                    "device_id": r["device_id"],
-                    "timestamp": r["timestamp"]
-                }
-                for r in reversed(rows)
-            ]
+                if USE_POSTGRES:
+                    conn = psycopg2.connect(SUPABASE_DB_URL)
+                    cursor = conn.cursor(cursor_factory=RealDictCursor)
+                    cursor.execute(
+                        """
+                        SELECT id, sound_level, threshold, led_state, device_id, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp
+                        FROM sensor_readings
+                        ORDER BY id DESC
+                        LIMIT %s;
+                        """,
+                        (limit,)
+                    )
+                    rows = cursor.fetchall()
+                    cursor.close()
+                    conn.close()
+                    history = [
+                        {
+                            "id": r["id"],
+                            "sound_level": r["sound_level"],
+                            "threshold": r["threshold"],
+                            "led_state": bool(r["led_state"]),
+                            "device_id": r["device_id"],
+                            "timestamp": str(r["timestamp"])
+                        }
+                        for r in reversed(rows)
+                    ]
+                else:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT id, sound_level, threshold, led_state, device_id, timestamp
+                        FROM sensor_readings
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (limit,)
+                    )
+                    rows = cursor.fetchall()
+                    cursor.close()
+                    conn.close()
+                    history = [
+                        {
+                            "id": r["id"],
+                            "sound_level": r["sound_level"],
+                            "threshold": r["threshold"],
+                            "led_state": bool(r["led_state"]),
+                            "device_id": r["device_id"],
+                            "timestamp": r["timestamp"]
+                        }
+                        for r in reversed(rows)
+                    ]
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -157,27 +237,50 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(history).encode("utf-8"))
 
         elif parsed.path == "/api/sensor-data/stats":
+            total, avg_val, max_val, min_val, alert_count = 0, 0, 0, 0, 0
             with db_lock:
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT 
-                        COUNT(*), 
-                        AVG(sound_level), 
-                        MAX(sound_level), 
-                        MIN(sound_level),
-                        SUM(CASE WHEN led_state = 1 THEN 1 ELSE 0 END)
-                    FROM sensor_readings
-                """)
-                total, avg_val, max_val, min_val, alert_count = cursor.fetchone()
-                conn.close()
+                if USE_POSTGRES:
+                    conn = psycopg2.connect(SUPABASE_DB_URL)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT 
+                            COUNT(*), 
+                            AVG(sound_level), 
+                            MAX(sound_level), 
+                            MIN(sound_level),
+                            SUM(CASE WHEN led_state = 1 THEN 1 ELSE 0 END)
+                        FROM sensor_readings;
+                    """)
+                    row = cursor.fetchone()
+                    if row:
+                        total, avg_val, max_val, min_val, alert_count = row
+                    cursor.close()
+                    conn.close()
+                else:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT 
+                            COUNT(*), 
+                            AVG(sound_level), 
+                            MAX(sound_level), 
+                            MIN(sound_level),
+                            SUM(CASE WHEN led_state = 1 THEN 1 ELSE 0 END)
+                        FROM sensor_readings
+                    """)
+                    row = cursor.fetchone()
+                    if row:
+                        total, avg_val, max_val, min_val, alert_count = row
+                    cursor.close()
+                    conn.close()
 
             stats = {
                 "total_readings": total or 0,
-                "average_sound_level": round(avg_val, 1) if avg_val is not None else 0,
+                "average_sound_level": round(float(avg_val), 1) if avg_val is not None else 0,
                 "max_sound_level": max_val or 0,
                 "min_sound_level": min_val or 0,
-                "alert_count": alert_count or 0
+                "alert_count": alert_count or 0,
+                "database_engine": "Supabase PostgreSQL" if USE_POSTGRES else "SQLite"
             }
 
             self.send_response(200)
@@ -198,14 +301,12 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         else:
-            # Fall back to static files
             super().do_GET()
 
 def run_server():
     server = HTTPServer(("0.0.0.0", PORT), IoTRequestHandler)
-    print(f"[*] IoT Backend Server running on http://0.0.0.0:{PORT}")
+    print(f"[*] IoT Backend running on port {PORT} (Engine: {'Supabase PostgreSQL' if USE_POSTGRES else 'SQLite'})")
     server.serve_forever()
 
 if __name__ == "__main__":
     run_server()
-
