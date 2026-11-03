@@ -3,12 +3,11 @@
 #include <HTTPClient.h>
 
 // ======================== WiFi & Backend Config ========================
-const char* ssid = "Moto";          // Replace with your WiFi network name
-const char* password = "Sneha@033";  // Replace with your WiFi password
+const char* ssid = "Moto";          // Your Wi-Fi network name
+const char* password = "Sneha@033";  // Your Wi-Fi password
 
-// Backend server URL (Your computer/server's local IP address and port 8000)
-// Example: "http://192.168.1.100:8000/api/sensor-data" or "http://10.141.184.43:8000/api/sensor-data"
-const char* serverUrl = "http://10.141.184.43:8000/api/sensor-data";
+// Public Render Backend URL
+const char* serverUrl = "https://clap-light-iot.onrender.com/api/sensor-data";
 
 // ======================== Pin Configuration ============================
 const int SOUND_SENSOR_PIN = 34;  // KY-038 AO (Analog Output)
