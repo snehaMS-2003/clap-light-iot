@@ -7,13 +7,24 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 import urllib.parse
 
 # PostgreSQL / Supabase connection support
-SUPABASE_DB_URL = os.getenv("DATABASE_URL")
-USE_POSTGRES = bool(SUPABASE_DB_URL and SUPABASE_DB_URL.startswith("postgres"))
+RAW_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# Clean up postgres:// to postgresql:// if needed
+if RAW_DATABASE_URL.startswith("postgres://"):
+    RAW_DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+SUPABASE_DB_URL = RAW_DATABASE_URL
+USE_POSTGRES = bool(SUPABASE_DB_URL and SUPABASE_DB_URL.startswith("postgresql://"))
+
+psycopg2 = None
+RealDictCursor = None
 
 if USE_POSTGRES:
     try:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
+        import psycopg2 as pg
+        from psycopg2.extras import RealDictCursor as rdc
+        psycopg2 = pg
+        RealDictCursor = rdc
         print(f"[*] Supabase PostgreSQL mode enabled.")
     except ImportError:
         print("[!] psycopg2 not installed. Falling back to SQLite.")
@@ -25,11 +36,19 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
+# Helper function to get a Postgres connection safely with timeout
+def get_pg_connection():
+    if not USE_POSTGRES:
+        return None
+    # Use 5 second connection timeout so threads don't hang and trigger 502
+    return psycopg2.connect(SUPABASE_DB_URL, connect_timeout=5)
+
 # Database Initialization
 def init_db():
+    initialized_pg = False
     if USE_POSTGRES:
         try:
-            conn = psycopg2.connect(SUPABASE_DB_URL)
+            conn = get_pg_connection()
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sensor_readings (
@@ -44,10 +63,13 @@ def init_db():
             conn.commit()
             cursor.close()
             conn.close()
+            initialized_pg = True
             print("[*] Supabase 'sensor_readings' table initialized successfully.")
         except Exception as e:
-            print(f"[!] Error initializing Supabase table: {e}")
-    else:
+            print(f"[!] Warning: Could not connect to Supabase database ({e}). SQLite fallback will be available.")
+
+    # Always ensure local SQLite table exists as safety fallback
+    try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
@@ -63,6 +85,8 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
+    except Exception as e:
+        print(f"[!] SQLite init error: {e}")
 
 init_db()
 
@@ -105,9 +129,13 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                 timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
                 reading_id = None
-                with db_lock:
-                    if USE_POSTGRES:
-                        conn = psycopg2.connect(SUPABASE_DB_URL)
+                backend_db = "sqlite"
+
+                # Try saving to Supabase first if configured
+                saved_to_pg = False
+                if USE_POSTGRES:
+                    try:
+                        conn = get_pg_connection()
                         cursor = conn.cursor()
                         cursor.execute(
                             """
@@ -120,7 +148,14 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                         conn.commit()
                         cursor.close()
                         conn.close()
-                    else:
+                        saved_to_pg = True
+                        backend_db = "supabase"
+                    except Exception as pg_err:
+                        print(f"[!] Supabase insert error ({pg_err}), saving to SQLite fallback...")
+
+                # Fallback or primary write to SQLite
+                if not saved_to_pg:
+                    with db_lock:
                         conn = sqlite3.connect(DB_PATH)
                         cursor = conn.cursor()
                         cursor.execute(
@@ -135,7 +170,7 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                         cursor.close()
                         conn.close()
 
-                # Update cache
+                # Update memory cache
                 latest_cache.update({
                     "id": reading_id,
                     "sound_level": sound_level,
@@ -149,10 +184,11 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self._send_cors_headers()
                 self.end_headers()
-                response = {"status": "success", "id": reading_id, "db": "supabase" if USE_POSTGRES else "sqlite"}
+                response = {"status": "success", "id": reading_id, "db": backend_db}
                 self.wfile.write(json.dumps(response).encode("utf-8"))
             except Exception as e:
                 self.send_response(400)
+                self.send_header("Content-Type", "application/json")
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
@@ -175,9 +211,11 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
             limit = int(query.get("limit", [30])[0])
 
             history = []
-            with db_lock:
-                if USE_POSTGRES:
-                    conn = psycopg2.connect(SUPABASE_DB_URL)
+            fetched_pg = False
+
+            if USE_POSTGRES:
+                try:
+                    conn = get_pg_connection()
                     cursor = conn.cursor(cursor_factory=RealDictCursor)
                     cursor.execute(
                         """
@@ -202,33 +240,41 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                         }
                         for r in reversed(rows)
                     ]
-                else:
-                    conn = sqlite3.connect(DB_PATH)
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        SELECT id, sound_level, threshold, led_state, device_id, timestamp
-                        FROM sensor_readings
-                        ORDER BY id DESC
-                        LIMIT ?
-                        """,
-                        (limit,)
-                    )
-                    rows = cursor.fetchall()
-                    cursor.close()
-                    conn.close()
-                    history = [
-                        {
-                            "id": r["id"],
-                            "sound_level": r["sound_level"],
-                            "threshold": r["threshold"],
-                            "led_state": bool(r["led_state"]),
-                            "device_id": r["device_id"],
-                            "timestamp": r["timestamp"]
-                        }
-                        for r in reversed(rows)
-                    ]
+                    fetched_pg = True
+                except Exception as pg_err:
+                    print(f"[!] Supabase query error in history ({pg_err}), falling back to SQLite...")
+
+            if not fetched_pg:
+                with db_lock:
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        conn.row_factory = sqlite3.Row
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            """
+                            SELECT id, sound_level, threshold, led_state, device_id, timestamp
+                            FROM sensor_readings
+                            ORDER BY id DESC
+                            LIMIT ?
+                            """,
+                            (limit,)
+                        )
+                        rows = cursor.fetchall()
+                        cursor.close()
+                        conn.close()
+                        history = [
+                            {
+                                "id": r["id"],
+                                "sound_level": r["sound_level"],
+                                "threshold": r["threshold"],
+                                "led_state": bool(r["led_state"]),
+                                "device_id": r["device_id"],
+                                "timestamp": r["timestamp"]
+                            }
+                            for r in reversed(rows)
+                        ]
+                    except Exception as sq_err:
+                        print(f"[!] SQLite query error: {sq_err}")
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -238,9 +284,11 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
 
         elif parsed.path == "/api/sensor-data/stats":
             total, avg_val, max_val, min_val, alert_count = 0, 0, 0, 0, 0
-            with db_lock:
-                if USE_POSTGRES:
-                    conn = psycopg2.connect(SUPABASE_DB_URL)
+            fetched_pg = False
+
+            if USE_POSTGRES:
+                try:
+                    conn = get_pg_connection()
                     cursor = conn.cursor()
                     cursor.execute("""
                         SELECT 
@@ -252,27 +300,35 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                         FROM sensor_readings;
                     """)
                     row = cursor.fetchone()
-                    if row:
+                    if row and row[0] is not None:
                         total, avg_val, max_val, min_val, alert_count = row
                     cursor.close()
                     conn.close()
-                else:
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT 
-                            COUNT(*), 
-                            AVG(sound_level), 
-                            MAX(sound_level), 
-                            MIN(sound_level),
-                            SUM(CASE WHEN led_state = 1 THEN 1 ELSE 0 END)
-                        FROM sensor_readings
-                    """)
-                    row = cursor.fetchone()
-                    if row:
-                        total, avg_val, max_val, min_val, alert_count = row
-                    cursor.close()
-                    conn.close()
+                    fetched_pg = True
+                except Exception as pg_err:
+                    print(f"[!] Supabase query error in stats ({pg_err}), falling back to SQLite...")
+
+            if not fetched_pg:
+                with db_lock:
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT 
+                                COUNT(*), 
+                                AVG(sound_level), 
+                                MAX(sound_level), 
+                                MIN(sound_level),
+                                SUM(CASE WHEN led_state = 1 THEN 1 ELSE 0 END)
+                            FROM sensor_readings
+                        """)
+                        row = cursor.fetchone()
+                        if row and row[0] is not None:
+                            total, avg_val, max_val, min_val, alert_count = row
+                        cursor.close()
+                        conn.close()
+                    except Exception as sq_err:
+                        print(f"[!] SQLite query error: {sq_err}")
 
             stats = {
                 "total_readings": total or 0,
@@ -280,7 +336,7 @@ class IoTRequestHandler(SimpleHTTPRequestHandler):
                 "max_sound_level": max_val or 0,
                 "min_sound_level": min_val or 0,
                 "alert_count": alert_count or 0,
-                "database_engine": "Supabase PostgreSQL" if USE_POSTGRES else "SQLite"
+                "database_engine": "Supabase PostgreSQL" if fetched_pg else "SQLite"
             }
 
             self.send_response(200)
