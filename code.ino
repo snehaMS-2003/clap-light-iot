@@ -1,29 +1,23 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 // ======================== WiFi & Backend Config ========================
-const char* ssid = "Moto";          // Your Wi-Fi network name
-const char* password = "Sneha@033";  // Your Wi-Fi password
+const char* ssid = "Moto 2";
+const char* password = "";
 
-// Public Render Backend URL
 const char* serverUrl = "https://clap-light-iot.onrender.com/api/sensor-data";
+const char* localServerUrl = "http://10.141.184.43:8000/api/sensor-data";
 
 // ======================== Pin Configuration ============================
-const int SOUND_SENSOR_PIN = 34;  // KY-038 AO (Analog Output)
-const int LED_PIN = 18;           // Green LED via current limiting resistor
+const int SOUND_SENSOR_PIN = 34;  // KY-038 AO
+const int LED_PIN = 18;           // Green LED
 
-// ======================== Operational Thresholds =======================
-// Adjust threshold after checking ambient room readings (KY-038 ADC: 0 to 4095)
-const int SOUND_THRESHOLD = 970;
-
-// LED hold time after the last detected sound (in milliseconds)
+const int SOUND_THRESHOLD = 960;
 const unsigned long HOLD_TIME_MS = 600;
+const unsigned long TELEMETRY_INTERVAL_MS = 300;
 
-// Telemetry interval to backend (e.g. transmit reading every 500ms or 1000ms)
-const unsigned long TELEMETRY_INTERVAL_MS = 500;
-
-// ======================== Variables ====================================
 bool ledState = false;
 bool soundWasDetected = false;
 
@@ -32,54 +26,67 @@ unsigned long lastPrintTime = 0;
 unsigned long lastTelemetryTime = 0;
 
 void connectToWiFi() {
-  Serial.print("Connecting to WiFi: ");
+  Serial.print("Connecting to Wi-Fi: ");
   Serial.println(ssid);
 
+  WiFi.disconnect(true);
+  delay(500);
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin(ssid, NULL);
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(400);
     Serial.print(".");
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected successfully!");
-    Serial.print("ESP32 IP Address: ");
+    Serial.println("\n>>> Wi-Fi Connected Successfully! <<<");
+    Serial.print("ESP32 IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\nWiFi connection failed! Running in offline mode; will retry periodically.");
+    Serial.println("\n[!] Wi-Fi connection timed out.");
   }
 }
 
 void sendSensorDataToBackend(int soundVal, int thresholdVal, bool currentLedState) {
   if (WiFi.status() != WL_CONNECTED) {
-    // Attempt non-blocking reconnect if disconnected
     WiFi.reconnect();
     return;
   }
 
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "application/json");
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(3);
 
-  // Construct JSON payload: {"sound_level": 850, "threshold": 960, "led_state": 0, "device_id": "ESP32_Sound_01"}
+  HTTPClient http;
+  if (!http.begin(client, serverUrl)) {
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setUserAgent("ESP32-KY038-Device");
+
   String payload = "{";
   payload += "\"sound_level\":" + String(soundVal) + ",";
   payload += "\"threshold\":" + String(thresholdVal) + ",";
   payload += "\"led_state\":" + String(currentLedState ? 1 : 0) + ",";
-  payload += "\"device_id\":\"ESP32_KY038_Node\"";
+  payload += "\"device_id\":\"ESP32_Hardware_COM11\"";
   payload += "}";
 
-  int httpResponseCode = http.POST(payload);
+  int httpCode = http.POST(payload);
 
-  if (httpResponseCode > 0) {
+  if (httpCode > 0) {
     // 200 OK
-    // Serial.printf("HTTP POST Success: %d\n", httpResponseCode);
   } else {
-    Serial.printf("HTTP POST Error: %s (code %d)\n", http.errorToString(httpResponseCode).c_str(), httpResponseCode);
+    HTTPClient localHttp;
+    if (localHttp.begin(localServerUrl)) {
+      localHttp.addHeader("Content-Type", "application/json");
+      localHttp.POST(payload);
+      localHttp.end();
+    }
   }
 
   http.end();
@@ -87,32 +94,20 @@ void sendSensorDataToBackend(int soundVal, int thresholdVal, bool currentLedStat
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
   pinMode(SOUND_SENSOR_PIN, INPUT);
   pinMode(LED_PIN, OUTPUT);
-
   digitalWrite(LED_PIN, LOW);
 
-  delay(1000);
-
-  Serial.println();
-  Serial.println("================================================");
-  Serial.println("  IoT Sound Monitoring System (KY-038 + ESP32)  ");
-  Serial.println("================================================");
-
-  // Initialize WiFi connection
   connectToWiFi();
-
-  Serial.println("Reading KY-038 analog output & transmitting telemetry...");
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // 1. Read analog sound level (ESP32 ADC 12-bit: 0 - 4095)
   int soundValue = analogRead(SOUND_SENSOR_PIN);
 
-  // 2. Local threshold detection & LED actuation
   if (soundValue > SOUND_THRESHOLD) {
     lastSoundTime = now;
     soundWasDetected = true;
@@ -120,30 +115,26 @@ void loop() {
     if (!ledState) {
       ledState = true;
       digitalWrite(LED_PIN, HIGH);
-      Serial.println(">>> Sound detected - LED ON <<<");
+      Serial.println(">>> SOUND TRIGGERED - LED ON <<<");
     }
   }
 
-  // Turn off after the sound level stays below threshold for HOLD_TIME_MS
   if (ledState && soundWasDetected && (now - lastSoundTime >= HOLD_TIME_MS)) {
     ledState = false;
     digitalWrite(LED_PIN, LOW);
     soundWasDetected = false;
-    Serial.println("--- Quiet detected - LED OFF ---");
+    Serial.println("--- Quiet - LED OFF ---");
   }
 
-  // 3. Periodic local Serial print
-  if (now - lastPrintTime >= 200) {
+  if (now - lastPrintTime >= 1000) {
     lastPrintTime = now;
-    Serial.print("Sound level: ");
-    Serial.print(soundValue);
-    Serial.print(" | Threshold: ");
-    Serial.print(SOUND_THRESHOLD);
-    Serial.print(" | LED: ");
-    Serial.println(ledState ? "ON" : "OFF");
+    Serial.printf("Sound: %d | LED: %s | WiFi: %s\n",
+      soundValue,
+      ledState ? "ON" : "OFF",
+      WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED"
+    );
   }
 
-  // 4. Send telemetry data to Containerized Backend over HTTP/JSON
   if (now - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryTime = now;
     sendSensorDataToBackend(soundValue, SOUND_THRESHOLD, ledState);
