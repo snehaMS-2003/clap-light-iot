@@ -323,8 +323,9 @@
     }
 
     let lastReceivedId = 0;
+    let lastDataTime = 0;
 
-    // Fast polling stream (300ms) fallback for zero-dependency native server
+    // Fast polling stream with active device heartbeat detection
     async function pollLiveStream() {
       try {
         const res = await fetch('/api/sensor-data/live');
@@ -332,16 +333,25 @@
           const data = await res.json();
           if (data.id && data.id !== lastReceivedId) {
             lastReceivedId = data.id;
+            lastDataTime = Date.now();
             handleIncomingData(data);
           }
+          
           const badge = document.getElementById('connectionBadge');
-          badge.className = 'flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
-          badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 mr-2"></span> Streaming Live';
+          const isRecentlyActive = (Date.now() - lastDataTime) < 3500;
+          
+          if (lastDataTime > 0 && isRecentlyActive) {
+            badge.className = 'flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
+            badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 mr-2 animate-pulse"></span> ESP32 Streaming Live';
+          } else {
+            badge.className = 'flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20';
+            badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-red-400 mr-2"></span> ESP32 Disconnected';
+          }
         }
       } catch (err) {
         const badge = document.getElementById('connectionBadge');
         badge.className = 'flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20';
-        badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse mr-2"></span> Connecting...';
+        badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse mr-2"></span> Server Connecting...';
       }
     }
 
