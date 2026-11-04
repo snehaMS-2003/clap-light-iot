@@ -147,7 +147,7 @@
           <thead class="text-xs uppercase bg-slate-700/50 text-slate-400 border-b border-slate-700">
             <tr>
               <th scope="col" class="px-4 py-3">Record ID</th>
-              <th scope="col" class="px-4 py-3">Timestamp (UTC)</th>
+              <th scope="col" class="px-4 py-3">Timestamp (IST)</th>
               <th scope="col" class="px-4 py-3">Device ID</th>
               <th scope="col" class="px-4 py-3">Sound Level</th>
               <th scope="col" class="px-4 py-3">Threshold</th>
@@ -227,6 +227,32 @@
       }
     });
 
+    // Helper function to format timestamp into user's local timezone (IST)
+    function formatToLocalTime(timestampStr) {
+      if (!timestampStr || timestampStr === '--') return new Date().toLocaleTimeString();
+      try {
+        // If string has no 'Z' or offset, treat it as UTC from server
+        let isoStr = timestampStr.replace(' ', 'T');
+        if (!isoStr.endsWith('Z') && !isoStr.includes('+')) {
+          isoStr += 'Z';
+        }
+        const date = new Date(isoStr);
+        if (isNaN(date.getTime())) return timestampStr;
+        return date.toLocaleString('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        });
+      } catch (e) {
+        return timestampStr;
+      }
+    }
+
     // Update UI elements
     function handleIncomingData(data) {
       document.getElementById('liveSoundVal').innerText = data.sound_level;
@@ -253,9 +279,10 @@
         ledText.innerText = 'QUIET (OFF)';
       }
 
-      // Update Chart
-      const timeStr = (data.timestamp || '').split(' ')[1] || new Date().toLocaleTimeString();
-      chartLabels.push(timeStr);
+      // Update Chart with local time
+      const formattedLocal = formatToLocalTime(data.timestamp);
+      const timeOnly = formattedLocal.includes(', ') ? formattedLocal.split(', ')[1] : formattedLocal.split(' ')[1] || formattedLocal;
+      chartLabels.push(timeOnly);
       soundDataPoints.push(data.sound_level);
       thresholdDataPoints.push(data.threshold);
 
@@ -267,19 +294,20 @@
       soundChart.update();
 
       // Update Table
-      appendTableRow(data);
+      appendTableRow(data, formattedLocal);
     }
 
-    function appendTableRow(data) {
+    function appendTableRow(data, formattedTime) {
       const tbody = document.getElementById('logsTableBody');
       if (tbody.children.length === 1 && tbody.children[0].innerText.includes('Waiting')) {
         tbody.innerHTML = '';
       }
+      const displayTime = formattedTime || formatToLocalTime(data.timestamp);
       const tr = document.createElement('tr');
       tr.className = data.led_state ? 'bg-red-950/20 text-emerald-300' : 'hover:bg-slate-800/40';
       tr.innerHTML = `
         <td class="px-4 py-2 font-medium">#${data.id || '-'}</td>
-        <td class="px-4 py-2 text-slate-400">${data.timestamp}</td>
+        <td class="px-4 py-2 text-slate-300 font-medium">${displayTime}</td>
         <td class="px-4 py-2">${data.device_id || 'ESP32'}</td>
         <td class="px-4 py-2 font-bold ${data.sound_level >= data.threshold ? 'text-amber-400' : 'text-slate-100'}">${data.sound_level}</td>
         <td class="px-4 py-2 text-slate-400">${data.threshold}</td>
